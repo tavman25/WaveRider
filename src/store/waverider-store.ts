@@ -61,17 +61,38 @@ interface WaveRiderState {
   // Editor State
   openFiles: string[];
   activeFile: string | null;
+  currentFile: string | null; // Currently viewed file path
+  fileContent: Record<string, string>; // Map of file paths to their content
 
   // AI State
   aiConnected: boolean;
   activeAgents: string[];
-  agentStatus: Record<string, 'idle' | 'thinking' | 'working' | 'error'>;
+  agentStatus: Record<string, { 
+    status: 'idle' | 'thinking' | 'working' | 'error'; 
+    message?: string; 
+    progress?: number; 
+    timestamp?: Date 
+  }>;
 
   // UI State
   sidebarOpen: boolean;
   panelOpen: boolean;
   terminalOpen: boolean;
   aiChatOpen: boolean;
+  terminalOutput: string[]; // Terminal command history
+  chatHistory: Array<{ role: 'user' | 'assistant'; content: string; timestamp: Date }>;
+
+  // Settings
+  settings: {
+    theme: 'light' | 'dark' | 'auto';
+    fontSize: number;
+    fontFamily: string;
+    tabSize: number;
+    wordWrap: boolean;
+    minimap: boolean;
+    autoSave: boolean;
+    ai: AIPreferences;
+  };
 
   // System
   initialized: boolean;
@@ -94,6 +115,12 @@ interface WaveRiderActions {
   openFile: (filePath: string) => void;
   closeFile: (filePath: string) => void;
   setActiveFile: (filePath: string | null) => void;
+  setCurrentFile: (filePath: string | null) => void;
+  setFileContent: (filePath: string, content: string) => void;
+  getFileContent: (filePath: string) => string | undefined;
+
+  // Settings
+  updateSettings: (settings: Partial<WaveRiderState['settings']>) => void;
 
   // AI
   setAIConnected: (connected: boolean) => void;
@@ -106,6 +133,10 @@ interface WaveRiderActions {
   togglePanel: () => void;
   toggleTerminal: () => void;
   toggleAIChat: () => void;
+  addToTerminal: (message: string) => void;
+  clearTerminal: () => void;
+  addToChatHistory: (role: 'user' | 'assistant', content: string) => void;
+  clearChatHistory: () => void;
 
   // System
   initialize: () => void;
@@ -124,6 +155,8 @@ const initialState: WaveRiderState = {
   recentProjects: [],
   openFiles: [],
   activeFile: null,
+  currentFile: null,
+  fileContent: {},
   aiConnected: false,
   activeAgents: [],
   agentStatus: {},
@@ -131,6 +164,24 @@ const initialState: WaveRiderState = {
   panelOpen: false,
   terminalOpen: false,
   aiChatOpen: false,
+  terminalOutput: [],
+  chatHistory: [],
+  settings: {
+    theme: 'dark',
+    fontSize: 14,
+    fontFamily: 'Consolas, Monaco, "Courier New", monospace',
+    tabSize: 2,
+    wordWrap: true,
+    minimap: true,
+    autoSave: true,
+    ai: {
+      model: 'grok-beta',
+      temperature: 0.7,
+      maxTokens: 4000,
+      autoSuggestions: true,
+      inlineCompletion: true,
+    },
+  },
   initialized: false,
   loading: false,
   error: null,
@@ -205,6 +256,21 @@ export const useWaveRiderStore = create<WaveRiderStore>()(
 
       setActiveFile: activeFile => set({ activeFile }),
 
+      setCurrentFile: currentFile => set({ currentFile }),
+
+      setFileContent: (filePath, content) =>
+        set(state => ({
+          fileContent: { ...state.fileContent, [filePath]: content },
+        })),
+
+      getFileContent: filePath => get().fileContent[filePath],
+
+      // Settings
+      updateSettings: settings =>
+        set(state => ({
+          settings: { ...state.settings, ...settings },
+        })),
+
       // AI
       setAIConnected: aiConnected => set({ aiConnected }),
 
@@ -231,6 +297,20 @@ export const useWaveRiderStore = create<WaveRiderStore>()(
       toggleTerminal: () => set(state => ({ terminalOpen: !state.terminalOpen })),
       toggleAIChat: () => set(state => ({ aiChatOpen: !state.aiChatOpen })),
 
+      addToTerminal: message =>
+        set(state => ({
+          terminalOutput: [...state.terminalOutput, message],
+        })),
+
+      clearTerminal: () => set({ terminalOutput: [] }),
+
+      addToChatHistory: (role, content) =>
+        set(state => ({
+          chatHistory: [...state.chatHistory, { role, content, timestamp: new Date() }],
+        })),
+
+      clearChatHistory: () => set({ chatHistory: [] }),
+
       // System
       initialize: () => set({ initialized: true }),
       setLoading: loading => set({ loading }),
@@ -244,10 +324,18 @@ export const useWaveRiderStore = create<WaveRiderStore>()(
         user: state.user,
         projects: state.projects,
         recentProjects: state.recentProjects,
+        currentProject: state.currentProject,
+        currentFile: state.currentFile,
+        fileContent: state.fileContent,
+        openFiles: state.openFiles,
+        activeFile: state.activeFile,
+        terminalOutput: state.terminalOutput,
+        chatHistory: state.chatHistory,
         sidebarOpen: state.sidebarOpen,
         panelOpen: state.panelOpen,
         terminalOpen: state.terminalOpen,
         aiChatOpen: state.aiChatOpen,
+        settings: state.settings,
       }),
     }
   )

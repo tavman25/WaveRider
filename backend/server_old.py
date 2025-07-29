@@ -555,6 +555,7 @@ class AgentBase:
     def extract_complexity(self, analysis: str) -> int:
         """Extract complexity rating from analysis"""
         # Simple regex to find complexity rating
+        import re
         match = re.search(r'complexity[:\s]*(\d+)', analysis.lower())
         return int(match.group(1)) if match else 5
 
@@ -754,6 +755,222 @@ async def health_check():
 
 @app.post("/api/chat")
 async def chat_endpoint(message: ChatMessage):
+    """Production-ready AI agent with full capabilities"""
+    session_id = str(uuid.uuid4())
+    
+    try:
+        # Send initial thinking status
+        await manager.broadcast(json.dumps({
+            "type": "agent_thinking",
+            "session_id": session_id,
+            "message": "🤔 Analyzing your request...",
+            "progress": 10
+        }))
+        
+        # Enhanced AI prompt for full capabilities
+        enhanced_prompt = f"""
+        You are a fully capable AI coding assistant in WaveRider IDE. You have complete control to:
+        1. Create entire project structures with all files
+        2. Write production-ready code (NO PLACEHOLDERS!)
+        3. Execute terminal commands automatically
+        4. Install dependencies and handle setup
+        5. Start development servers
+        6. Debug and fix issues
+        
+        User Request: {message.message}
+        Context: {message.context or 'Building something awesome'}
+        Project ID: {message.project_id or 'Will create new project'}
+        
+        RESPOND WITH JSON IN THIS EXACT FORMAT:
+        {{
+            "thinking": "Your detailed thought process - what you're analyzing and planning",
+            "action": "create_and_run",
+            "message": "Friendly explanation of what you're building",
+            "files": [
+                {{"path": "package.json", "content": "COMPLETE package.json with all deps"}},
+                {{"path": "src/App.tsx", "content": "COMPLETE React component code"}},
+                {{"path": "public/index.html", "content": "COMPLETE HTML file"}},
+                {{"path": "src/index.tsx", "content": "COMPLETE React entry point"}}
+            ],
+            "commands": [
+                "npm install",
+                "npm start"
+            ],
+            "next_steps": "What happens next and what user should expect"
+        }}
+        
+        CRITICAL RULES:
+        - For React projects: ALWAYS use port 3001 (3000 is taken)
+        - Include ALL necessary files for a working project
+        - NO placeholders or TODO comments
+        - Auto-run the project after creation
+        - Be proactive - if they want something built, BUILD IT COMPLETELY
+        
+        This is VIBE CODING - make it work immediately!
+        """
+        
+        # Progress: AI Processing
+        await manager.broadcast(json.dumps({
+            "type": "agent_thinking", 
+            "session_id": session_id,
+            "message": "🧠 AI is thinking and planning...",
+            "progress": 30
+        }))
+        
+        # Get AI response
+        response = await ai_service.chat_with_grok(enhanced_prompt)
+        
+        # Progress: Parsing
+        await manager.broadcast(json.dumps({
+            "type": "agent_thinking",
+            "session_id": session_id, 
+            "message": "⚙️ Parsing AI response and preparing actions...",
+            "progress": 50
+        }))
+        
+        # Parse AI response
+        files_created = []
+        commands_executed = []
+        execution_results = []
+        project_id = message.project_id
+        
+        try:
+            # Parse JSON response
+            if response.strip().startswith('{'):
+                ai_response = json.loads(response)
+            else:
+                # Extract JSON from response
+                json_match = re.search(r'\{[\s\S]*\}', response)
+                if json_match:
+                    ai_response = json.loads(json_match.group())
+                else:
+                    raise ValueError("No valid JSON found in AI response")
+            
+            # Create project if needed
+            if not project_id:
+                project_id = str(uuid.uuid4())
+                await fs_service.create_project(project_id)
+                await manager.broadcast(json.dumps({
+                    "type": "project_created",
+                    "project_id": project_id,
+                    "message": "🆕 Created new project"
+                }))
+            
+            # Progress: Creating files
+            await manager.broadcast(json.dumps({
+                "type": "agent_thinking",
+                "session_id": session_id,
+                "message": "📝 Creating project files...",
+                "progress": 70
+            }))
+            
+            # Create all files
+            if "files" in ai_response and ai_response["files"]:
+                for i, file_data in enumerate(ai_response["files"]):
+                    if "path" in file_data:
+                        path = file_data["path"]
+                        content = file_data.get("content", "")
+                        
+                        if content is None or path.endswith('/'):
+                            # Create directory
+                            project_path = fs_service.get_project_path(project_id)
+                            dir_path = project_path / path.rstrip('/')
+                            dir_path.mkdir(parents=True, exist_ok=True)
+                            files_created.append(f"{path} (directory)")
+                        else:
+                            # Create file
+                            success = await fs_service.write_file(project_id, path, content)
+                            if success:
+                                files_created.append(path)
+                                
+                                # Send file creation update
+                                await manager.broadcast(json.dumps({
+                                    "type": "file_created",
+                                    "session_id": session_id,
+                                    "file": path,
+                                    "progress": 70 + (i / len(ai_response["files"])) * 15
+                                }))
+            
+            # Progress: Executing commands
+            await manager.broadcast(json.dumps({
+                "type": "agent_thinking",
+                "session_id": session_id,
+                "message": "🚀 Installing dependencies and starting project...",
+                "progress": 85
+            }))
+            
+            # Execute commands
+            if "commands" in ai_response and ai_response["commands"]:
+                for command in ai_response["commands"]:
+                    await manager.broadcast(json.dumps({
+                        "type": "command_executing",
+                        "session_id": session_id,
+                        "command": command,
+                        "message": f"Running: {command}"
+                    }))
+                    
+                    # Execute command
+                    result = await execute_project_command(project_id, command)
+                    commands_executed.append(command)
+                    execution_results.append(result)
+                    
+                    # Send result
+                    await manager.broadcast(json.dumps({
+                        "type": "command_result",
+                        "session_id": session_id,
+                        "command": command,
+                        "success": result.get("success", False),
+                        "output": result.get("output", "")[:300]
+                    }))
+            
+            # Final success
+            await manager.broadcast(json.dumps({
+                "type": "agent_complete",
+                "session_id": session_id,
+                "message": "✅ Project ready! " + ai_response.get("next_steps", ""),
+                "progress": 100
+            }))
+            
+            return {
+                "success": True,
+                "session_id": session_id,
+                "project_id": project_id,
+                "thinking": ai_response.get("thinking", "Created your project"),
+                "response": ai_response.get("message", "Project created successfully!"),
+                "files_created": files_created,
+                "commands_executed": commands_executed,
+                "execution_results": execution_results,
+                "next_steps": ai_response.get("next_steps", "Your project is ready to use!"),
+                "timestamp": datetime.now().isoformat()
+            }
+            
+        except Exception as parse_error:
+            logger.error(f"Error executing AI response: {parse_error}")
+            
+            # Fallback to basic chat
+            await manager.broadcast(json.dumps({
+                "type": "agent_fallback",
+                "session_id": session_id,
+                "message": "💬 Providing guidance instead",
+                "progress": 100
+            }))
+            
+            return {
+                "success": True,
+                "response": response,
+                "session_id": session_id,
+                "project_id": project_id,
+                "timestamp": datetime.now().isoformat()
+            }
+        
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        await manager.broadcast(json.dumps({
+            "type": "agent_error",
+            "session_id": session_id,
+            "message": f"❌ Error: {str(e)}"
+        }))
+        raise HTTPException(status_code=500, detail=f"AI agent error: {str(e)}")
     """Enhanced chat with AI agents that can create files"""
     try:
         # Check if this is a file creation request
@@ -832,6 +1049,7 @@ async def chat_endpoint(message: ChatMessage):
                     }
             except json.JSONDecodeError:
                 # If not valid JSON, try to extract JSON from the text response
+                import re
                 json_match = re.search(r'\{[\s\S]*\}', response)
                 if json_match:
                     try:
@@ -941,6 +1159,46 @@ async def chat_endpoint(message: ChatMessage):
         logger.error(f"Chat error: {e}")
         raise HTTPException(status_code=500, detail="Chat service temporarily unavailable")
 
+@app.post("/api/create-from-json")
+async def create_files_from_json(request: dict):
+    """Create files from JSON structure - for when AI provides JSON response"""
+    try:
+        project_id = request.get("project_id")
+        files_data = request.get("files", [])
+        
+        if not project_id:
+            raise HTTPException(status_code=400, detail="Project ID required")
+        
+        files_created = []
+        
+        for file_data in files_data:
+            if "path" in file_data:
+                path = file_data["path"]
+                content = file_data.get("content", "")
+                
+                # Handle directory creation (content is null)
+                if content is None:
+                    # Create directory
+                    project_path = fs_service.get_project_path(project_id)
+                    dir_path = project_path / path
+                    dir_path.mkdir(parents=True, exist_ok=True)
+                    files_created.append(f"{path} (directory)")
+                else:
+                    # Create file
+                    success = await fs_service.write_file(project_id, path, content)
+                    if success:
+                        files_created.append(path)
+        
+        return {
+            "success": True,
+            "files_created": files_created,
+            "message": f"Created {len(files_created)} items"
+        }
+        
+    except Exception as e:
+        logger.error(f"File creation error: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create files: {str(e)}")
+
 @app.post("/api/tasks")
 async def create_task(task_request: TaskRequest, db: Session = Depends(get_db)):
     """Create and execute agent task"""
@@ -1044,6 +1302,234 @@ async def file_operation(operation: FileOperation):
         logger.error(f"File operation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/api/projects/import")
+async def import_project(request: dict):
+    """Import an existing project from file system"""
+    try:
+        source_path = request.get("source_path")
+        project_name = request.get("project_name", "imported-project")
+        
+        if not source_path:
+            raise HTTPException(status_code=400, detail="Source path is required")
+        
+        # Validate source path exists
+        source_dir = Path(source_path)
+        if not source_dir.exists():
+            raise HTTPException(status_code=400, detail="Source path does not exist")
+        
+        if not source_dir.is_dir():
+            raise HTTPException(status_code=400, detail="Source path must be a directory")
+        
+        # Create new project ID
+        project_id = str(uuid.uuid4())
+        project_path = fs_service.get_project_path(project_id)
+        
+        # Copy directory contents
+        import shutil
+        shutil.copytree(source_path, project_path, dirs_exist_ok=True)
+        
+        # Create project record in database
+        db_project = Project(
+            id=project_id,
+            name=project_name,
+            description=f"Imported from {source_path}",
+            created_at=datetime.now()
+        )
+        
+        # Try to save to database (with SQLite fallback)
+        try:
+            db = next(get_db())
+            db.add(db_project)
+            db.commit()
+        except Exception as db_error:
+            logger.warning(f"Database save failed, continuing without DB: {db_error}")
+        
+        logger.info(f"Successfully imported project from {source_path} to {project_id}")
+        
+        return {
+            "success": True,
+            "project_id": project_id,
+            "project_name": project_name,
+            "message": f"Successfully imported project from {source_path}"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to import project: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to import project: {str(e)}")
+
+@app.get("/api/browse")
+async def browse_filesystem(path: str = ""):
+    """Browse local filesystem for project import"""
+    try:
+        if not path:
+            # Return common directories on Windows
+            import os
+            home_dir = os.path.expanduser("~")
+            common_dirs = [
+                {"name": "Home", "path": home_dir, "type": "directory"},
+                {"name": "Documents", "path": os.path.join(home_dir, "Documents"), "type": "directory"},
+                {"name": "Desktop", "path": os.path.join(home_dir, "Desktop"), "type": "directory"},
+                {"name": "Downloads", "path": os.path.join(home_dir, "Downloads"), "type": "directory"},
+            ]
+            
+            # Add drive letters on Windows
+            if os.name == 'nt':
+                import string
+                drives = [f"{letter}:\\" for letter in string.ascii_uppercase if os.path.exists(f"{letter}:\\")]
+                for drive in drives:
+                    common_dirs.append({"name": drive, "path": drive, "type": "directory"})
+            
+            return {"directories": common_dirs}
+        
+        # Browse specific directory
+        browse_path = Path(path)
+        if not browse_path.exists():
+            raise HTTPException(status_code=404, detail="Path does not exist")
+        
+        if not browse_path.is_dir():
+            raise HTTPException(status_code=400, detail="Path is not a directory")
+        
+        directories = []
+        try:
+            for item in browse_path.iterdir():
+                if item.is_dir():
+                    directories.append({
+                        "name": item.name,
+                        "path": str(item),
+                        "type": "directory"
+                    })
+        except PermissionError:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        
+        # Sort directories alphabetically
+        directories.sort(key=lambda x: x["name"].lower())
+        
+        # Add parent directory option (if not at root)
+        if browse_path.parent != browse_path:
+            directories.insert(0, {
+                "name": ".. (Parent Directory)",
+                "path": str(browse_path.parent),
+                "type": "directory"
+            })
+        
+        return {"directories": directories, "current_path": str(browse_path)}
+        
+    except Exception as e:
+        logger.error(f"Failed to browse filesystem: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to browse filesystem: {str(e)}")
+
+@app.post("/api/terminal/execute")
+async def execute_terminal_command(request: dict):
+    """Execute terminal commands in project directory"""
+    try:
+        command = request.get("command", "").strip()
+        project_id = request.get("project_id")
+        
+        if not command:
+            raise HTTPException(status_code=400, detail="Command is required")
+        
+        if not project_id:
+            raise HTTPException(status_code=400, detail="Project ID is required")
+        
+        # Get project directory
+        project_path = fs_service.get_project_path(project_id)
+        if not project_path.exists():
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Security: Only allow safe commands
+        safe_commands = [
+            'npm', 'node', 'yarn', 'ls', 'dir', 'pwd', 'cd', 'cat', 'type', 
+            'git', 'pip', 'python', 'tsc', 'eslint', 'prettier', 'jest',
+            'ng', 'vue', 'react-scripts', 'vite', 'webpack', 'pnpm', 'bun'
+        ]
+        
+        # Handle compound commands (with &&, ||, ;)
+        # Split by && and check each command
+        if '&&' in command:
+            command_groups = command.split('&&')
+            for cmd_group in command_groups:
+                cmd_parts = cmd_group.strip().split()
+                if cmd_parts and cmd_parts[0] not in safe_commands:
+                    return {
+                        "success": False,
+                        "output": f"Command '{cmd_parts[0]}' is not allowed for security reasons.",
+                        "error": "Security restriction"
+                    }
+        else:
+            command_parts = command.split()
+            if command_parts and command_parts[0] not in safe_commands:
+                return {
+                    "success": False,
+                    "output": f"Command '{command_parts[0]}' is not allowed for security reasons.",
+                    "error": "Security restriction"
+                }
+        
+        # Execute command
+        import subprocess
+        
+        try:
+            # Change to project directory and execute
+            # Ensure PATH includes system paths for npm, node etc.
+            env = os.environ.copy()
+            
+            # Convert path to string and ensure it exists
+            cwd_path = str(project_path)
+            logger.info(f"Executing command '{command}' in directory: {cwd_path}")
+            
+            if not project_path.exists():
+                return {
+                    "success": False,
+                    "output": f"Project directory does not exist: {cwd_path}",
+                    "error": "Directory not found"
+                }
+            
+            # Use synchronous subprocess for Windows compatibility
+            result = subprocess.run(
+                command,
+                cwd=cwd_path,
+                shell=True,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=60  # 60 second timeout
+            )
+            
+            output = ""
+            if result.stdout:
+                output += result.stdout
+            if result.stderr:
+                output += "\n" + result.stderr
+            
+            logger.info(f"Command '{command}' executed with return code {result.returncode}")
+            logger.info(f"Output: {output[:200]}...")  # Log first 200 chars
+            
+            return {
+                "success": result.returncode == 0,
+                "output": output.strip(),
+                "return_code": result.returncode,
+                "command": command,
+                "cwd": cwd_path
+            }
+            
+        except subprocess.TimeoutExpired:
+            logger.error(f"Command '{command}' timed out after 60 seconds")
+            return {
+                "success": False,
+                "output": f"Command '{command}' timed out after 60 seconds",
+                "error": "Timeout"
+            }
+        except Exception as cmd_error:
+            logger.error(f"Command execution failed: {cmd_error}", exc_info=True)
+            return {
+                "success": False,
+                "output": f"Failed to execute command: {str(cmd_error)}",
+                "error": str(cmd_error)
+            }
+        
+    except Exception as e:
+        logger.error(f"Terminal command error: {e}")
+        raise HTTPException(status_code=500, detail=f"Terminal error: {str(e)}")
+
 @app.get("/api/projects/{project_id}/files")
 async def list_project_files(project_id: str, directory: str = "."):
     """List files in project directory"""
@@ -1111,30 +1597,6 @@ async def list_projects(db: Session = Depends(get_db)):
         logger.error(f"List projects error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/terminal/execute")
-async def execute_terminal_command(command_data: dict):
-    """Execute a terminal command in a project"""
-    try:
-        project_id = command_data.get("project_id")
-        command = command_data.get("command")
-        
-        if not project_id or not command:
-            raise HTTPException(status_code=400, detail="project_id and command are required")
-        
-        # Execute the command
-        result = await execute_project_command(project_id, command)
-        
-        return {
-            "success": result["success"],
-            "output": result["output"],
-            "return_code": result.get("return_code", -1),
-            "command": result.get("command", command)
-        }
-        
-    except Exception as e:
-        logger.error(f"Terminal execution error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.websocket("/ws/{client_id}")
 async def websocket_endpoint(websocket: WebSocket, client_id: str):
     """WebSocket endpoint for real-time updates"""
@@ -1172,6 +1634,16 @@ async def list_agents():
                 "type": "debugger", 
                 "name": "Debug Assistant",
                 "description": "Analyzes and fixes code issues"
+            },
+            {
+                "type": "analyzer",
+                "name": "Code Analyzer", 
+                "description": "Analyzes code quality and suggests improvements"
+            },
+            {
+                "type": "optimizer",
+                "name": "Performance Optimizer",
+                "description": "Optimizes code for better performance"
             }
         ]
     }
@@ -1205,3 +1677,398 @@ if __name__ == "__main__":
         reload=True,
         log_level="info"
     )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Data models
+class ChatMessage(BaseModel):
+    message: str
+    context: Optional[str] = None
+
+class TaskRequest(BaseModel):
+    task: str
+    type: str  # "code", "debug", "analyze", "optimize"
+    context: Optional[str] = None
+
+class AgentResponse(BaseModel):
+    agent_id: str
+    agent_type: str
+    response: str
+    thinking: str
+    confidence: float
+    next_actions: List[str]
+
+# In-memory storage for active connections
+active_connections: Dict[str, WebSocket] = {}
+
+# AI Agent Classes
+class BaseAgent:
+    def __init__(self, agent_id: str, agent_type: str):
+        self.agent_id = agent_id
+        self.agent_type = agent_type
+        self.status = "ready"
+    
+    async def process(self, task: str, context: str = None) -> AgentResponse:
+        raise NotImplementedError
+
+class PlannerAgent(BaseAgent):
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id, "planner")
+    
+    async def process(self, task: str, context: str = None) -> AgentResponse:
+        # Simulate thinking time
+        await asyncio.sleep(1)
+        
+        # Analyze the task and break it down
+        thinking = f"Analyzing task: '{task}'. Breaking down into actionable steps..."
+        
+        if "create" in task.lower() or "build" in task.lower():
+            response = f"""I'll help you {task}. Here's my plan:
+
+1. **Analysis Phase**: Understand requirements and constraints
+2. **Architecture Design**: Define structure and components  
+3. **Implementation Strategy**: Break into manageable chunks
+4. **Testing Approach**: Define validation criteria
+
+Let me coordinate with the Coder Agent to implement this."""
+            next_actions = ["coordinate_with_coder", "define_architecture", "create_implementation_plan"]
+            
+        elif "debug" in task.lower() or "fix" in task.lower():
+            response = f"""I'll analyze the debugging task: {task}
+
+**Debug Strategy**:
+1. Identify error patterns and symptoms
+2. Trace execution flow 
+3. Isolate root cause
+4. Propose targeted fixes
+
+Coordinating with Debugger Agent for detailed analysis."""
+            next_actions = ["analyze_error_logs", "coordinate_with_debugger", "propose_fixes"]
+            
+        elif "optimize" in task.lower() or "improve" in task.lower():
+            response = f"""Optimization plan for: {task}
+
+**Optimization Strategy**:
+1. Performance profiling and bottleneck identification
+2. Code quality analysis
+3. Resource usage optimization
+4. Best practices implementation
+
+I'll work with the Optimizer Agent on this."""
+            next_actions = ["profile_performance", "coordinate_with_optimizer", "implement_improvements"]
+            
+        else:
+            response = f"""I'll help you with: {task}
+
+**General Approach**:
+1. Requirement analysis
+2. Solution design
+3. Implementation planning
+4. Quality assurance
+
+Let me coordinate with the appropriate agents to execute this plan."""
+            next_actions = ["analyze_requirements", "design_solution", "coordinate_execution"]
+        
+        return AgentResponse(
+            agent_id=self.agent_id,
+            agent_type=self.agent_type,
+            response=response,
+            thinking=thinking,
+            confidence=0.9,
+            next_actions=next_actions
+        )
+
+class CoderAgent(BaseAgent):
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id, "coder")
+    
+    async def process(self, task: str, context: str = None) -> AgentResponse:
+        await asyncio.sleep(1.5)
+        
+        thinking = f"Analyzing coding task: '{task}'. Determining best implementation approach..."
+        
+        if "function" in task.lower() or "method" in task.lower():
+            response = f"""I'll create the function for: {task}
+
+```javascript
+// Generated function based on your request
+function processTask(input) {{
+    // Implementation logic here
+    console.log('Processing:', input);
+    
+    // Add your specific logic
+    const result = {{
+        status: 'completed',
+        data: input,
+        timestamp: new Date().toISOString()
+    }};
+    
+    return result;
+}}
+
+// Example usage
+const output = processTask('{task}');
+console.log(output);
+```
+
+This function provides a solid foundation. Would you like me to modify it for your specific use case?"""
+            next_actions = ["refine_implementation", "add_error_handling", "write_tests"]
+            
+        elif "component" in task.lower() or "react" in task.lower():
+            response = f"""Creating React component for: {task}
+
+```tsx
+import React, {{ useState, useEffect }} from 'react';
+
+interface ComponentProps {{
+    data?: any;
+    onUpdate?: (value: any) => void;
+}}
+
+export const CustomComponent: React.FC<ComponentProps> = ({{ data, onUpdate }}) => {{
+    const [state, setState] = useState(null);
+    
+    useEffect(() => {{
+        // Initialize component
+        console.log('Component initialized with:', data);
+    }}, [data]);
+    
+    const handleAction = () => {{
+        // Handle user interaction
+        const newValue = 'Updated value';
+        setState(newValue);
+        onUpdate?.(newValue);
+    }};
+    
+    return (
+        <div className="custom-component">
+            <h3>Custom Component</h3>
+            <p>Status: {{state || 'Ready'}}</p>
+            <button onClick={{handleAction}}>
+                Execute Action
+            </button>
+        </div>
+    );
+}};
+```
+
+This component is ready to be customized for your specific needs."""
+            next_actions = ["customize_props", "add_styling", "implement_logic"]
+            
+        else:
+            response = f"""I'm ready to code: {task}
+
+I can help you with:
+- Function implementations
+- React components  
+- API endpoints
+- Data processing logic
+- Algorithm implementations
+
+Please provide more specific requirements and I'll generate the exact code you need."""
+            next_actions = ["clarify_requirements", "choose_technology", "implement_solution"]
+        
+        return AgentResponse(
+            agent_id=self.agent_id,
+            agent_type=self.agent_type,
+            response=response,
+            thinking=thinking,
+            confidence=0.85,
+            next_actions=next_actions
+        )
+
+class DebuggerAgent(BaseAgent):
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id, "debugger")
+    
+    async def process(self, task: str, context: str = None) -> AgentResponse:
+        await asyncio.sleep(1.2)
+        
+        thinking = f"Debugging analysis for: '{task}'. Examining potential issues and solutions..."
+        
+        if "error" in task.lower() or "bug" in task.lower():
+            response = f"""🔍 **Debug Analysis for**: {task}
+
+**Common Issues Identified**:
+1. **Syntax Errors**: Check for missing brackets, semicolons
+2. **Type Mismatches**: Verify variable types and function signatures  
+3. **Async/Promise Issues**: Ensure proper await/then handling
+4. **Scope Problems**: Check variable accessibility
+
+**Debugging Steps**:
+```javascript
+// Add console logging for debugging
+console.log('Debug checkpoint 1:', variableName);
+
+// Check for null/undefined values
+if (data && data.property) {{
+    console.log('Data is valid:', data);
+}} else {{
+    console.error('Data validation failed:', data);
+}}
+
+// Try-catch for error handling
+try {{
+    const result = riskyOperation();
+    console.log('Success:', result);
+}} catch (error) {{
+    console.error('Error caught:', error.message);
+}}
+```
+
+**Recommended Fixes**:
+- Add proper error boundaries
+- Implement input validation
+- Use TypeScript for better type safety"""
+            next_actions = ["add_error_handling", "implement_logging", "validate_inputs"]
+            
+        else:
+            response = f"""🐛 **Debugger Agent Ready**
+
+I can help you debug:
+- Runtime errors and exceptions
+- Logic errors and unexpected behavior
+- Performance issues
+- Memory leaks
+- API call failures
+
+Share your error messages or describe the unexpected behavior, and I'll provide targeted debugging solutions."""
+            next_actions = ["analyze_error_logs", "identify_root_cause", "provide_solution"]
+        
+        return AgentResponse(
+            agent_id=self.agent_id,
+            agent_type=self.agent_type,
+            response=response,
+            thinking=thinking,
+            confidence=0.88,
+            next_actions=next_actions
+        )
+
+class OptimizerAgent(BaseAgent):
+    def __init__(self, agent_id: str):
+        super().__init__(agent_id, "optimizer")
+    
+    async def process(self, task: str, context: str = None) -> AgentResponse:
+        await asyncio.sleep(1.3)
+        
+        thinking = f"Performance optimization analysis for: '{task}'. Identifying improvement opportunities..."
+        
+        if "optimize" in task.lower() or "performance" in task.lower():
+            response = f"""⚡ **Performance Optimization for**: {task}
+
+**Optimization Opportunities**:
+
+1. **Code Efficiency**:
+```javascript
+// Before (inefficient)
+const slowFunction = (arr) => {{
+    return arr.filter(item => item.active)
+             .map(item => item.value)
+             .reduce((sum, val) => sum + val, 0);
+}}
+
+// After (optimized)
+const fastFunction = (arr) => {{
+    let sum = 0;
+    for (const item of arr) {{
+        if (item.active) sum += item.value;
+    }}
+    return sum;
+}}
+```
+
+**Performance Gains**: 60-80% improvement expected"""
+            next_actions = ["implement_caching", "optimize_algorithms", "profile_performance"]
+            
+        else:
+            response = f"""🚀 **Optimizer Agent Ready**
+
+I can optimize:
+- Algorithm efficiency
+- Memory usage
+- Bundle size
+- Database queries
+- Network requests
+- Rendering performance
+
+What specific performance issue would you like me to address?"""
+            next_actions = ["identify_bottlenecks", "measure_performance", "implement_optimizations"]
+        
+        return AgentResponse(
+            agent_id=self.agent_id,
+            agent_type=self.agent_type,
+            response=response,
+            thinking=thinking,
+            confidence=0.92,
+            next_actions=next_actions
+        )
+
+# Initialize agents
+agents = {
+    "planner": PlannerAgent("planner-001"),
+    "coder": CoderAgent("coder-001"), 
+    "debugger": DebuggerAgent("debugger-001"),
+    "optimizer": OptimizerAgent("optimizer-001")
+}
+
+@app.get("/")
+async def root():
+    return {"message": "WaveRider AI Backend is running!", "status": "active", "agents": len(agents)}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "agents": len(agents)}
+
+@app.post("/chat")
+async def chat_with_ai(message: ChatMessage):
+    """Process chat message with AI agents"""
+    try:
+        # Determine which agent to use based on message content
+        message_lower = message.message.lower()
+        
+        if any(word in message_lower for word in ["plan", "strategy", "approach", "organize"]):
+            agent = agents["planner"]
+        elif any(word in message_lower for word in ["code", "function", "implement", "create", "build"]):
+            agent = agents["coder"]
+        elif any(word in message_lower for word in ["debug", "error", "bug", "fix", "problem"]):
+            agent = agents["debugger"]
+        elif any(word in message_lower for word in ["optimize", "performance", "improve", "faster"]):
+            agent = agents["optimizer"]
+        else:
+            # Default to planner for general questions
+            agent = agents["planner"]
+        
+        # Process with selected agent
+        response = await agent.process(message.message, message.context)
+        
+        return {
+            "success": True,
+            "agent_used": agent.agent_type,
+            "response": response.response,
+            "thinking": response.thinking,
+            "confidence": response.confidence,
+            "next_actions": response.next_actions,
+            "timestamp": time.time()
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI processing error: {str(e)}")
+
+@app.get("/api/agents")
+async def get_agents():
+    return {
+        "agents": [
+            {"id": agent.agent_id, "name": f"{agent.agent_type.title()} Agent", "status": agent.status, "type": agent.agent_type}
+            for agent in agents.values()
+        ]
+    }
+
+if __name__ == "__main__":
+    print("Starting WaveRider AI Backend...")
+    uvicorn.run(app, host="127.0.0.1", port=8002, log_level="info")
