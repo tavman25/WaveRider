@@ -1,0 +1,22 @@
+{
+  "extends": ["next/core-web-vitals"],
+  "rules": {
+    "react-hooks/exhaustive-deps": "warn",
+    "react/no-unescaped-entities": "off",
+    "@next/next/no-page-custom-font": "off",
+    "prefer-const": "error",
+    "no-var": "error",
+    "no-console": ["warn", { "allow": ["warn", "error"] }],
+    "eqeqeq": ["error", "always"],
+    "no-duplicate-imports": "error",
+    "no-unused-expressions": "error"
+  },
+  "overrides": [
+    {
+      "files": ["*.test.ts", "*.test.tsx"],
+      "rules": {
+        "no-console": "off"
+      }
+    }
+  ]
+}

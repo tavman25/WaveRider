@@ -1,0 +1,16 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "WaveRider: Start Development",
+			"type": "shell",
+			"command": "echo",
+			"args": [
+				"Starting WaveRider development environment..."
+			],
+			"group": "build",
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}
