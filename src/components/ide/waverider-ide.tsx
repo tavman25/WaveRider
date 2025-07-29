@@ -75,7 +75,7 @@ interface ChatMessage {
   agent_type?: string;
 }
 
-const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8002';
+const BACKEND_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8002';
 
 export default function WaveRiderIDE() {
   // State management
@@ -304,9 +304,29 @@ export default function WaveRiderIDE() {
 
       if (response.ok) {
         const data = await response.json();
+        
+        // Create AI response message
+        let aiResponse = data.response;
+        
+        // If files were created, add them to the response and refresh file list
+        if (data.files_created && data.files_created.length > 0) {
+          aiResponse += `\n\n✅ Created files:\n${data.files_created.map((f: string) => `• ${f}`).join('\n')}`;
+          
+          if (data.instructions) {
+            aiResponse += `\n\n📋 Instructions: ${data.instructions}`;
+          }
+          
+          // Refresh the file list to show new files
+          if (currentProject) {
+            addToTerminal(`📁 Refreshing files after creation...`);
+            await loadProjectFiles(currentProject.id);
+            addToTerminal(`✅ Created ${data.files_created.length} files`);
+          }
+        }
+        
         const aiMessage: ChatMessage = {
           id: (Date.now() + 1).toString(),
-          content: data.response,
+          content: aiResponse,
           sender: 'ai',
           timestamp: data.timestamp,
         };
