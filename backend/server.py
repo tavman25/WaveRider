@@ -4,6 +4,15 @@ WaveRider Production Backend
 Real AI agents with file system operations and progress tracking
 """
 
+# Load environment variables from .env.local file
+from dotenv import load_dotenv
+import os
+from pathlib import Path
+
+# Load .env.local from parent directory
+env_path = Path(__file__).parent.parent / '.env.local'
+load_dotenv(env_path)
+
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -36,7 +45,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Database setup
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost/waverider")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    # Use SQLite fallback for local development
+    DATABASE_URL = "sqlite:///./waverider.db"
+    logger.info("Using SQLite database for local development")
+else:
+    logger.info(f"Using database: {DATABASE_URL}")
+
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 engine = create_engine(DATABASE_URL)
@@ -196,7 +212,7 @@ class AIService:
                 }
                 
                 payload = {
-                    "model": "grok-beta",
+                    "model": "grok-2-1212",
                     "messages": [
                         {"role": "system", "content": "You are an expert AI coding assistant."},
                         {"role": "user", "content": f"Context: {context}\n\nMessage: {message}"}
@@ -228,7 +244,7 @@ class AIService:
         try:
             response = await asyncio.to_thread(
                 self.openai_client.chat.completions.create,
-                model="gpt-4",
+                model="gpt-3.5-turbo",  # Use gpt-3.5-turbo which is more widely available
                 messages=[
                     {"role": "system", "content": "You are an expert AI coding assistant."},
                     {"role": "user", "content": f"Context: {context}\n\nMessage: {message}"}
@@ -246,7 +262,7 @@ class AIService:
         try:
             response = await asyncio.to_thread(
                 self.anthropic_client.messages.create,
-                model="claude-3-sonnet-20240229",
+                model="claude-3-5-sonnet-20241022",  # Use the latest available Claude model
                 max_tokens=2000,
                 messages=[
                     {"role": "user", "content": f"Context: {context}\n\nMessage: {message}"}
@@ -630,8 +646,72 @@ async def health_check():
 
 @app.post("/api/chat")
 async def chat_endpoint(message: ChatMessage):
-    """Chat with AI agents"""
+    """Enhanced chat with AI agents that can create files"""
     try:
+        # Check if this is a file creation request
+        is_file_request = any(keyword in message.message.lower() for keyword in [
+            'create', 'generate', 'make', 'build', 'write', 'setup', 'initialize'
+        ]) and any(filetype in message.message.lower() for filetype in [
+            'file', 'project', 'app', 'component', 'script', 'page', 'webapp', 'react', 'html', 'css', 'js'
+        ])
+        
+        if is_file_request and message.project_id:
+            # Enhanced prompt for file creation
+            enhanced_prompt = f"""
+            IMPORTANT: You must create actual files, not just instructions!
+            
+            User Request: {message.message}
+            Context: {message.context or 'No additional context'}
+            
+            You MUST respond with ONLY a valid JSON object in this exact format:
+            {{
+                "response": "Brief explanation of what you created",
+                "files": [
+                    {{"path": "package.json", "content": "actual file content here"}},
+                    {{"path": "src/App.js", "content": "actual React component code here"}},
+                    {{"path": "src/index.js", "content": "actual index.js code here"}},
+                    {{"path": "public/index.html", "content": "actual HTML code here"}}
+                ],
+                "instructions": "How to run: npm install && npm start"
+            }}
+            
+            RULES:
+            - Return ONLY valid JSON, no other text
+            - Create real, working files with complete content
+            - Include all necessary files for a functional project
+            - Use proper file paths relative to project root
+            - No markdown formatting, just raw JSON
+            """
+            
+            response = await ai_service.chat_with_grok(enhanced_prompt)
+            
+            # Try to parse JSON response and create files
+            files_created = []
+            try:
+                parsed_response = json.loads(response)
+                if "files" in parsed_response:
+                    for file_data in parsed_response["files"]:
+                        if "path" in file_data and "content" in file_data:
+                            success = await fs_service.write_file(
+                                message.project_id, 
+                                file_data["path"], 
+                                file_data["content"]
+                            )
+                            if success:
+                                files_created.append(file_data["path"])
+                    
+                    return {
+                        "success": True,
+                        "response": parsed_response.get("response", response),
+                        "files_created": files_created,
+                        "instructions": parsed_response.get("instructions", ""),
+                        "timestamp": datetime.now().isoformat()
+                    }
+            except json.JSONDecodeError:
+                # Fallback: try to extract file information from text response
+                pass
+        
+        # Regular chat response
         response = await ai_service.chat_with_grok(
             message.message, 
             message.context
