@@ -686,8 +686,6 @@ export default function WaveRiderIDE() {
   };
 
   const openFile = async (file: FileNode) => {
-    console.log('OpenFile called with:', file); // Debug log
-    
     if (file.type === 'directory') {
       toggleDirectory(file.path);
       return;
