@@ -21,13 +21,16 @@ import json
 import asyncio
 import uuid
 import os
-import aiofiles
+# import aiofiles  # Not needed, using regular file operations
 import subprocess
 import shutil
 import string
 import re
 from typing import Dict, List, Optional, Any
 import time
+import socket
+import httpx
+import logging
 from datetime import datetime
 import uvicorn
 from pathlib import Path
@@ -359,8 +362,8 @@ class FileSystemService:
         """Read file content"""
         try:
             full_path = self.get_project_path(project_id) / file_path
-            async with aiofiles.open(full_path, 'r', encoding='utf-8') as f:
-                return await f.read()
+            with open(full_path, 'r', encoding='utf-8') as f:
+                return f.read()
         except Exception as e:
             logger.error(f"Failed to read file {file_path}: {e}")
             raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
@@ -371,8 +374,8 @@ class FileSystemService:
             full_path = self.get_project_path(project_id) / file_path
             full_path.parent.mkdir(parents=True, exist_ok=True)
             
-            async with aiofiles.open(full_path, 'w', encoding='utf-8') as f:
-                await f.write(content)
+            with open(full_path, 'w', encoding='utf-8') as f:
+                f.write(content)
             return True
         except Exception as e:
             logger.error(f"Failed to write file {file_path}: {e}")
@@ -424,6 +427,473 @@ class FileSystemService:
             return []
 
 fs_service = FileSystemService()
+
+# Real Development Server Management
+class DevelopmentServerManager:
+    def __init__(self):
+        self.running_servers = {}  # project_id -> server_info
+        self.port_manager = PortManager()
+        
+    async def start_development_server(self, project_id: str) -> Dict[str, Any]:
+        """Start a real development server for the project"""
+        try:
+            project_path = fs_service.get_project_path(project_id)
+            if not project_path.exists():
+                return {"success": False, "error": "Project not found"}
+            
+            # Auto-detect project type and get dev command
+            dev_command = await self.detect_and_get_dev_command(project_path)
+            if not dev_command:
+                return {"success": False, "error": "No development command available - ensure dependencies are installed"}
+            
+            # Allocate port
+            port = await self.port_manager.allocate_port()
+            if not port:
+                return {"success": False, "error": "No available ports"}
+            
+            # Install dependencies if needed
+            try:
+                await self.ensure_dependencies_installed(project_path)
+            except Exception as dep_error:
+                await self.port_manager.release_port(port)  # Release the port since we failed
+                return {"success": False, "error": f"Failed to install dependencies: {str(dep_error)}"}
+            
+            # Dependencies are now properly installed
+            
+            # Modify command to use specific port
+            dev_command_with_port = self.modify_command_for_port(dev_command, port, project_path)
+            logger.info(f"🔧 Original command: {dev_command}")
+            logger.info(f"🔧 Modified command: {dev_command_with_port}")
+            logger.info(f"🔧 Using port: {port}")
+            logger.info(f"🔧 Project path: {project_path}")
+            
+            # Start the server
+            process = await self.start_server_process(project_id, project_path, dev_command_with_port, port)
+            
+            if process:
+                url = f"http://localhost:{port}"
+                self.running_servers[project_id] = {
+                    "process": process,
+                    "port": port,
+                    "url": url,
+                    "command": dev_command_with_port,
+                    "started_at": datetime.now(),
+                    "status": "starting"
+                }
+                
+                # Wait a moment and check if server started successfully
+                await asyncio.sleep(3)
+                if await self.check_server_health(url):
+                    self.running_servers[project_id]["status"] = "running"
+                    logger.info(f"✅ Development server started successfully: {url}")
+                    return {"success": True, "url": url, "port": port, "status": "running"}
+                else:
+                    self.running_servers[project_id]["status"] = "starting"
+                    logger.info(f"🔄 Development server starting: {url}")
+                    return {"success": True, "url": url, "port": port, "status": "starting"}
+            
+            return {"success": False, "error": "Failed to start server process"}
+            
+        except Exception as e:
+            logger.error(f"Development server start error: {e}")
+            return {"success": False, "error": str(e)}
+    
+    async def detect_and_get_dev_command(self, project_path: Path) -> Optional[str]:
+        """Auto-detect project type and return appropriate development command"""
+        
+        # Check for Docker setup first
+        docker_compose_path = project_path / "docker-compose.yml"
+        dockerfile_path = project_path / "Dockerfile"
+        
+        if docker_compose_path.exists():
+            logger.info(f"🐳 Found Docker Compose configuration: {docker_compose_path}")
+            return "docker-compose up --build"
+        elif dockerfile_path.exists():
+            logger.info(f"🐳 Found Dockerfile: {dockerfile_path}")
+            # Use Docker with dynamic port mapping
+            return "docker build -t temp-project . && docker run --rm -p {port}:{internal_port} temp-project"
+        
+        # Check for Node.js projects
+        package_json_path = project_path / "package.json"
+        if package_json_path.exists():
+            try:
+                with open(package_json_path, 'r') as f:
+                    package_json = json.load(f)
+                    scripts = package_json.get("scripts", {})
+                    
+                    # Priority order for dev commands
+                    if "dev" in scripts:
+                        return "npm run dev"
+                    elif "start" in scripts:
+                        return "npm start"
+                    elif "serve" in scripts:
+                        return "npm run serve"
+                    else:
+                        return "npm start"  # fallback
+            except:
+                return "npm start"
+        
+        # Check for Python projects
+        if (project_path / "main.py").exists():
+            return "python main.py"
+        elif (project_path / "app.py").exists():
+            return "python app.py"
+        elif (project_path / "manage.py").exists():
+            return "python manage.py runserver"
+        
+        # Check for other project types
+        if (project_path / "Cargo.toml").exists():
+            return "cargo run"
+        elif (project_path / "go.mod").exists():
+            return "go run ."
+        
+        return None
+    
+    async def ensure_dependencies_installed(self, project_path: Path):
+        """Ensure project dependencies are installed"""
+        try:
+            # Node.js dependencies
+            if (project_path / "package.json").exists() and not (project_path / "node_modules").exists():
+                logger.info("Installing Node.js dependencies...")
+                process = await asyncio.create_subprocess_shell(
+                    "npm install",
+                    cwd=str(project_path),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+                if process.returncode != 0:
+                    logger.error(f"npm install failed: {stderr.decode()}")
+                    raise Exception(f"npm install failed: {stderr.decode()}")
+                else:
+                    logger.info("✅ Node.js dependencies installed successfully")
+            
+            # Python dependencies
+            if (project_path / "requirements.txt").exists():
+                logger.info("Installing Python dependencies...")
+                # Use regular subprocess to avoid Windows asyncio issues
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ["python", "-m", "pip", "install", "-r", "requirements.txt", "--user"],
+                        cwd=str(project_path),
+                        capture_output=True,
+                        text=True,
+                        timeout=120  # 2 minute timeout
+                    )
+                    
+                    logger.info(f"pip install return code: {result.returncode}")
+                    logger.info(f"pip install stdout: {result.stdout}")
+                    if result.stderr:
+                        logger.info(f"pip install stderr: {result.stderr}")
+                    
+                    if result.returncode != 0:
+                        error_msg = result.stderr or result.stdout or "Unknown pip installation error"
+                        logger.error(f"pip install failed with return code {result.returncode}: {error_msg}")
+                        raise Exception(f"pip install failed: {error_msg}")
+                    else:
+                        logger.info("✅ Python dependencies installed successfully")
+                except subprocess.TimeoutExpired:
+                    logger.error("pip install timed out")
+                    raise Exception("pip install timed out")
+                except Exception as pip_error:
+                    logger.error(f"pip install process error: {str(pip_error)}")
+                    raise Exception(f"pip install process error: {str(pip_error)}")
+                
+        except Exception as e:
+            error_msg = str(e) if str(e) else "Unknown dependency installation error"
+            logger.warning(f"Failed to install dependencies: {error_msg}")
+            raise Exception(error_msg)  # Re-raise with proper error message
+    
+    def modify_command_for_port(self, command: str, port: int, project_path: Path) -> str:
+        """Modify the command to use a specific port based on project type"""
+        
+        # Handle Docker commands
+        if "docker-compose up" in command:
+            # For docker-compose, we'll use environment variable for port
+            return f"PORT={port} docker-compose up --build"
+        elif "docker build" in command and "docker run" in command:
+            # Replace the port placeholder in Docker run command
+            internal_port = 5000  # Default internal port for Flask
+            if "{port}" in command and "{internal_port}" in command:
+                return command.format(port=port, internal_port=internal_port)
+            else:
+                # Fallback: add port mapping
+                return command.replace("docker run --rm", f"docker run --rm -p {port}:{internal_port}")
+        
+        # Check for Next.js
+        elif "next dev" in command or (project_path / "next.config.js").exists():
+            return f"{command} --port {port}"
+        
+        # Check for Create React App
+        elif "react-scripts start" in command or "npm start" in command:
+            package_json_path = project_path / "package.json"
+            if package_json_path.exists():
+                try:
+                    with open(package_json_path, 'r') as f:
+                        package_json = json.load(f)
+                        if "react-scripts" in package_json.get("dependencies", {}):
+                            return f"PORT={port} {command}"
+                except:
+                    pass
+        
+        # Check for Vue.js
+        elif "vue" in command.lower() or (project_path / "vue.config.js").exists():
+            return f"{command} --port {port}"
+        
+        # Check for Vite
+        elif "vite" in command or (project_path / "vite.config.js").exists():
+            return f"{command} --port {port}"
+        
+        # Python/FastAPI/Flask projects
+        elif "python" in command:
+            # Check if it's a Flask app
+            if (project_path / "app.py").exists():
+                # For Flask apps, we need to set the PORT environment variable
+                # and modify the app.py to use it, or use Flask's command-line options
+                return f"python -m flask run --host=0.0.0.0 --port={port}"
+            else:
+                # For other Python apps that might accept --port
+                return f"{command} --host 0.0.0.0 --port {port}"
+        
+        return command
+    
+    async def start_server_process(self, project_id: str, project_path: Path, command: str, port: int):
+        """Start the actual server process"""
+        try:
+            # Set up environment
+            env = os.environ.copy()
+            env["PORT"] = str(port)
+            env["NODE_ENV"] = "development"
+            
+            # Flask-specific environment variables
+            if "flask run" in command or "docker-compose" in command:
+                env["FLASK_APP"] = "app.py"
+                env["FLASK_ENV"] = "development"
+                env["FLASK_DEBUG"] = "1"
+            
+            # Docker-specific environment variables
+            if "docker" in command:
+                env["DOCKER_BUILDKIT"] = "1"  # Enable BuildKit for faster builds
+                
+            logger.info(f"🚀 Starting process with command: {command}")
+            logger.info(f"🚀 Working directory: {project_path}")
+            logger.info(f"🚀 Environment PORT: {env.get('PORT')}")
+            logger.info(f"🚀 Environment FLASK_APP: {env.get('FLASK_APP', 'Not set')}")
+            if "docker" in command:
+                logger.info(f"🐳 Using Docker for containerized development")
+            
+            # Use regular subprocess.Popen for better Windows compatibility
+            import subprocess
+            import shlex
+            
+            # Split command properly for Windows
+            if os.name == 'nt':  # Windows
+                # Use shell=True on Windows for better command parsing
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(project_path),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    shell=True,
+                    text=True,
+                    bufsize=1
+                )
+            else:
+                # Unix-like systems
+                args = shlex.split(command)
+                process = subprocess.Popen(
+                    args,
+                    cwd=str(project_path),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    text=True,
+                    bufsize=1
+                )
+            
+            logger.info(f"✅ Process started successfully with PID: {process.pid}")
+            
+            # Start output monitoring task
+            asyncio.create_task(self.monitor_process_output_sync(project_id, process))
+            
+            return process
+            
+        except Exception as e:
+            error_msg = str(e) if str(e) else "Unknown process start error"
+            logger.error(f"Failed to start server process: {error_msg}")
+            logger.error(f"Command: {command}")
+            logger.error(f"Working directory: {project_path}")
+            logger.error(f"Exception type: {type(e).__name__}")
+            return None
+    
+    async def monitor_process_output_sync(self, project_id: str, process):
+        """Monitor synchronous process output for logging and health checks"""
+        try:
+            import threading
+            
+            def read_stdout():
+                try:
+                    for line in iter(process.stdout.readline, ''):
+                        if line:
+                            output = line.strip()
+                            logger.info(f"[{project_id}] {output}")
+                except Exception as e:
+                    logger.error(f"Error reading stdout: {e}")
+            
+            def read_stderr():
+                try:
+                    for line in iter(process.stderr.readline, ''):
+                        if line:
+                            output = line.strip()
+                            logger.error(f"[{project_id}] ERROR: {output}")
+                except Exception as e:
+                    logger.error(f"Error reading stderr: {e}")
+            
+            # Start reading threads
+            stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+            stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+            
+            stdout_thread.start()
+            stderr_thread.start()
+            
+        except Exception as e:
+            logger.error(f"Error setting up process monitoring: {e}")
+    
+    async def monitor_process_output(self, project_id: str, process):
+        """Monitor process output for logging and health checks"""
+        try:
+            while True:
+                line = await process.stdout.readline()
+                if not line:
+                    break
+                
+                output = line.decode().strip()
+                if output:
+                    logger.info(f"[{project_id}] {output}")
+                    
+                    # Check for server ready indicators
+                    if any(indicator in output.lower() for indicator in 
+                          ["server ready", "compiled successfully", "ready on", "running on", "local:", "development server"]):
+                        if project_id in self.running_servers:
+                            self.running_servers[project_id]["status"] = "running"
+                            
+        except Exception as e:
+            logger.error(f"Process monitoring error for {project_id}: {e}")
+    
+    async def check_server_health(self, url: str) -> bool:
+        """Check if the server is responding"""
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(url)
+                return response.status_code < 500
+        except:
+            return False
+    
+    async def stop_server(self, project_id: str) -> bool:
+        """Stop the development server for a project"""
+        if project_id not in self.running_servers:
+            return False
+        
+        try:
+            server_info = self.running_servers[project_id]
+            process = server_info["process"]
+            port = server_info["port"]
+            
+            # Terminate process
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+            
+            # Release port
+            await self.port_manager.release_port(port)
+            
+            # Remove from running servers
+            del self.running_servers[project_id]
+            
+            logger.info(f"🛑 Stopped development server for project {project_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to stop development server: {e}")
+            return False
+    
+    async def get_server_status(self, project_id: str) -> Dict[str, Any]:
+        """Get the status of a project's development server"""
+        if project_id not in self.running_servers:
+            return {"running": False}
+        
+        server_info = self.running_servers[project_id]
+        
+        # Check if process is still alive
+        if server_info["process"].returncode is not None:
+            # Process has died, clean up
+            await self.stop_server(project_id)
+            return {"running": False}
+        
+        # Check server health
+        is_healthy = await self.check_server_health(server_info["url"])
+        
+        return {
+            "running": True,
+            "url": server_info["url"],
+            "port": server_info["port"],
+            "status": server_info["status"],
+            "healthy": is_healthy,
+            "started_at": server_info["started_at"].isoformat(),
+            "uptime_seconds": (datetime.now() - server_info["started_at"]).total_seconds()
+        }
+    
+    async def list_running_servers(self) -> Dict[str, Any]:
+        """List all running development servers"""
+        servers = {}
+        for project_id, server_info in self.running_servers.items():
+            servers[project_id] = await self.get_server_status(project_id)
+        return servers
+
+class PortManager:
+    def __init__(self, start_port: int = 4000, end_port: int = 4100):
+        self.start_port = start_port
+        self.end_port = end_port
+        self.allocated_ports = set()
+        # Reserve ports that are already in use by WaveRider
+        self.reserved_ports = {3000, 8002, 8001}  # Frontend, Backend, Agent Server
+    
+    async def allocate_port(self) -> Optional[int]:
+        """Allocate an available port"""
+        for port in range(self.start_port, self.end_port + 1):
+            if (port not in self.allocated_ports and 
+                port not in self.reserved_ports and 
+                await self.is_port_free(port)):
+                self.allocated_ports.add(port)
+                return port
+        return None
+    
+    async def release_port(self, port: int):
+        """Release a port back to the pool"""
+        self.allocated_ports.discard(port)
+    
+    async def is_port_free(self, port: int) -> bool:
+        """Check if a port is free"""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(('localhost', port))
+            sock.close()
+            return result != 0
+        except:
+            return False
+
+# Global development server manager
+dev_server_manager = DevelopmentServerManager()
+
+async def start_project_development_server(project_id: str) -> Dict[str, Any]:
+    """Start development server for a project - convenience function"""
+    return await dev_server_manager.start_development_server(project_id)
 
 # Helper function for executing commands in projects
 async def execute_project_command(project_id: str, command: str) -> Dict[str, Any]:
@@ -751,6 +1221,100 @@ async def health_check():
         health_status["services"]["ai_services"] = "error"
     
     return health_status
+
+@app.get("/api/status/ai-services")
+async def check_ai_services_status():
+    """Check the status and credits of all AI services"""
+    status = {
+        "timestamp": datetime.now().isoformat(),
+        "services": {}
+    }
+    
+    # Check OpenAI
+    try:
+        openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        # Make a minimal test request to check if API key works
+        test_response = openai_client.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": "test"}],
+            max_tokens=1
+        )
+        status["services"]["openai"] = {
+            "status": "active",
+            "model_tested": "gpt-3.5-turbo",
+            "api_key_valid": True,
+            "usage_info": "API key working - check OpenAI dashboard for credit details"
+        }
+    except openai.RateLimitError as e:
+        status["services"]["openai"] = {
+            "status": "rate_limited",
+            "error": str(e),
+            "api_key_valid": True,
+            "issue": "Rate limit exceeded or insufficient credits"
+        }
+    except openai.AuthenticationError as e:
+        status["services"]["openai"] = {
+            "status": "auth_error",
+            "error": str(e),
+            "api_key_valid": False,
+            "issue": "Invalid API key"
+        }
+    except Exception as e:
+        status["services"]["openai"] = {
+            "status": "error",
+            "error": str(e),
+            "api_key_valid": "unknown"
+        }
+    
+    # Check Anthropic
+    try:
+        anthropic_client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        test_response = anthropic_client.messages.create(
+            model="claude-3-haiku-20240307",
+            max_tokens=1,
+            messages=[{"role": "user", "content": "test"}]
+        )
+        status["services"]["anthropic"] = {
+            "status": "active",
+            "model_tested": "claude-3-haiku-20240307",
+            "api_key_valid": True,
+            "usage_info": "API key working - check Anthropic console for credit details"
+        }
+    except anthropic.RateLimitError as e:
+        status["services"]["anthropic"] = {
+            "status": "rate_limited",
+            "error": str(e),
+            "api_key_valid": True,
+            "issue": "Rate limit exceeded or insufficient credits"
+        }
+    except anthropic.AuthenticationError as e:
+        status["services"]["anthropic"] = {
+            "status": "auth_error",
+            "error": str(e),
+            "api_key_valid": False,
+            "issue": "Invalid API key"
+        }
+    except Exception as e:
+        status["services"]["anthropic"] = {
+            "status": "error",
+            "error": str(e),
+            "api_key_valid": "unknown"
+        }
+    
+    return status
+
+@app.get("/api/status/environment")
+async def check_environment_status():
+    """Check environment variables and configuration"""
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "environment": {
+            "openai_api_key_set": bool(os.getenv("OPENAI_API_KEY")),
+            "anthropic_api_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+            "openai_key_prefix": os.getenv("OPENAI_API_KEY", "")[:7] + "..." if os.getenv("OPENAI_API_KEY") else "Not set",
+            "anthropic_key_prefix": os.getenv("ANTHROPIC_API_KEY", "")[:7] + "..." if os.getenv("ANTHROPIC_API_KEY") else "Not set"
+        }
+    }
 
 @app.post("/api/chat")
 async def chat_endpoint(message: ChatMessage):
@@ -1111,6 +1675,318 @@ async def list_projects(db: Session = Depends(get_db)):
         logger.error(f"List projects error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.get("/api/projects/{project_id}")
+async def get_project(project_id: str, db: Session = Depends(get_db)):
+    """Get a single project by ID"""
+    try:
+        project = db.query(Project).filter(Project.id == project_id, Project.is_active == True).first()
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        return {
+            "id": project.id,
+            "name": project.name,
+            "description": project.description,
+            "created_at": project.created_at.isoformat(),
+            "updated_at": project.updated_at.isoformat() if project.updated_at else None
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Get project error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/projects/generate")
+async def generate_ai_project(project_data: dict, db: Session = Depends(get_db)):
+    """Generate a complete, working project with production-ready functionality"""
+    try:
+        project_id = str(uuid.uuid4())
+        template_id = project_data.get("template", "simple-react")  # Changed from template_id to template
+        project_name = project_data.get("name", "Generated Project")
+        project_description = project_data.get("description", "")
+        features = project_data.get("features", [])
+        custom_requirements = project_data.get("custom_requirements", "")
+        
+        logger.info(f"🚀 Creating working project: {project_name}")
+        
+        # Create project directory first
+        await fs_service.create_project(project_id)
+        
+        # Store in database
+        db_project = Project(
+            id=project_id,
+            name=project_name,
+            description=project_description,
+            owner_id=project_data.get("owner_id", "anonymous"),
+            settings={
+                "template": template_id,
+                "features": features,
+                "custom_requirements": custom_requirements
+            }
+        )
+        db.add(db_project)
+        db.commit()
+        
+        # Generate actual working project files
+        files_created = await create_working_project(project_id, template_id, project_name, project_description, features)
+        
+        if files_created == 0:
+            raise HTTPException(status_code=500, detail="Failed to create project files")
+        
+        # Get the file tree for the generated project
+        try:
+            file_tree = await fs_service.list_files(project_id)
+        except Exception as e:
+            logger.error(f"Failed to get file tree: {e}")
+            file_tree = []
+
+        return {
+            "success": True,
+            "project_id": project_id,
+            "message": f"Created working project: {project_name}",
+            "files_created": files_created,
+            "file_tree": file_tree,
+            "ready_to_run": True,
+            "instructions": f"Project ready! Run 'npm install && npm start' in the project directory to start development."
+        }
+        
+    except Exception as e:
+        logger.error(f"Project creation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def create_working_project(project_id: str, template: str, name: str, description: str, features: list) -> int:
+    """Generate actual project files using AI based on user requirements"""
+    try:
+        logger.info(f"🤖 Using AI to generate project: {name}")
+        
+        # Prepare AI prompt with user requirements
+        ai_prompt = f"""Create a complete, production-ready {template} project with the following specifications:
+
+Project Name: {name}
+Description: {description}
+Features: {', '.join(features) if features else 'Basic functionality'}
+
+Generate COMPLETE, FUNCTIONAL code files for this project. Include:
+1. All necessary configuration files (package.json, tsconfig.json, etc.)
+2. Core application files with real functionality
+3. Proper project structure
+4. Working dependencies
+5. README with accurate setup instructions
+
+Return the response as a JSON object with this structure:
+{{
+    "files": {{
+        "path/to/file1": "complete file content here",
+        "path/to/file2": "complete file content here"
+    }}
+}}
+
+Make sure all code is production-ready and actually works."""
+
+        # Try OpenAI first, fallback to Anthropic
+        files_data = {}
+        try:
+            # Use OpenAI for project generation with increased token limit
+            openai_client = openai.OpenAI()
+            response = await asyncio.to_thread(
+                openai_client.chat.completions.create,
+                model="gpt-4o-mini",  # Use more efficient model
+                messages=[
+                    {"role": "system", "content": "You are an expert software architect who creates complete, working project structures. Always return valid JSON with complete file contents."},
+                    {"role": "user", "content": ai_prompt}
+                ],
+                max_tokens=16000,  # Increased from 4000 to 16000
+                temperature=0.3
+            )
+            
+            # Parse the AI response
+            ai_content = response.choices[0].message.content.strip()
+            if ai_content.startswith('```json'):
+                ai_content = ai_content[7:-3].strip()
+            elif ai_content.startswith('```'):
+                ai_content = ai_content[3:-3].strip()
+            
+            files_data = json.loads(ai_content)
+            logger.info(f"✅ OpenAI generated {len(files_data.get('files', {}))} files")
+            
+        except Exception as openai_error:
+            logger.warning(f"OpenAI failed, trying Anthropic: {openai_error}")
+            try:
+                # Fallback to Anthropic with increased token limit
+                anthropic_client = anthropic.Anthropic()
+                response = await asyncio.to_thread(
+                    anthropic_client.messages.create,
+                    model="claude-3-haiku-20240307",  # Use faster, cheaper model
+                    max_tokens=8000,  # Increased from 4000 to 8000
+                    messages=[
+                        {"role": "user", "content": ai_prompt}
+                    ]
+                )
+                
+                ai_content = response.content[0].text.strip()
+                if ai_content.startswith('```json'):
+                    ai_content = ai_content[7:-3].strip()
+                elif ai_content.startswith('```'):
+                    ai_content = ai_content[3:-3].strip()
+                
+                files_data = json.loads(ai_content)
+                logger.info(f"✅ Anthropic generated {len(files_data.get('files', {}))} files")
+                
+            except Exception as anthropic_error:
+                logger.error(f"Both AI services failed. OpenAI: {openai_error}, Anthropic: {anthropic_error}")
+                raise HTTPException(status_code=500, detail="AI project generation failed - please check API keys")
+
+        # Create the actual files
+        project_path = fs_service.get_project_path(project_id)
+        files_created = 0
+        
+        for file_path, content in files_data.get('files', {}).items():
+            try:
+                full_path = project_path / file_path
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Handle JSON content properly
+                if isinstance(content, dict):
+                    content = json.dumps(content, indent=2)
+                elif not isinstance(content, str):
+                    content = str(content)
+                
+                # Write file
+                with open(full_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                
+                files_created += 1
+                logger.info(f"📄 Created: {file_path}")
+                
+            except Exception as file_error:
+                logger.error(f"Failed to create {file_path}: {file_error}")
+                continue
+        
+        if files_created == 0:
+            raise HTTPException(status_code=500, detail="No files were created - AI response may be invalid")
+        
+        logger.info(f"✅ AI generated project with {files_created} files")
+        return files_created
+        
+    except Exception as e:
+        logger.error(f"AI project generation failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Project generation failed: {str(e)}")
+
+# Preview Management API Endpoints
+@app.post("/api/projects/{project_id}/start")
+async def start_project_development_endpoint(project_id: str, db: Session = Depends(get_db)):
+    """Start a development server for a project"""
+    try:
+        # Get project info from database
+        db_project = db.query(Project).filter(Project.id == project_id).first()
+        if not db_project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        logger.info(f"� Starting development server for project {project_id}")
+        
+        # Start the development server
+        result = await dev_server_manager.start_development_server(project_id)
+        
+        if result["success"]:
+            return {
+                "success": True,
+                "message": "Development server started successfully",
+                "url": result["url"],
+                "port": result["port"],
+                "status": result["status"]
+            }
+        else:
+            raise HTTPException(status_code=500, detail=result["error"])
+            
+    except Exception as e:
+        logger.error(f"Development server start error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/projects/{project_id}/stop")
+async def stop_project_development_endpoint(project_id: str):
+    """Stop the development server for a project"""
+    try:
+        success = await dev_server_manager.stop_server(project_id)
+        
+        if success:
+            return {
+                "success": True,
+                "message": "Development server stopped successfully"
+            }
+        else:
+            return {
+                "success": False,
+                "message": "No development server running for this project"
+            }
+            
+    except Exception as e:
+        logger.error(f"Development server stop error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/projects/{project_id}/status")
+async def get_project_development_status(project_id: str):
+    """Get the development server status for a project"""
+    try:
+        status = await dev_server_manager.get_server_status(project_id)
+        return {
+            "success": True,
+            "project_id": project_id,
+            **status
+        }
+        
+    except Exception as e:
+        logger.error(f"Development server status error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/development/servers")
+async def list_all_development_servers():
+    """List all running development servers"""
+    try:
+        servers = await dev_server_manager.list_running_servers()
+        return {
+            "success": True,
+            "servers": servers,
+            "count": len(servers)
+        }
+        
+    except Exception as e:
+        logger.error(f"Development servers list error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/projects/{project_id}/install-dependencies")
+async def install_project_dependencies(project_id: str):
+    """Install dependencies for a project"""
+    try:
+        project_path = fs_service.get_project_path(project_id)
+        if not project_path.exists():
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Check for package.json
+        package_json_path = project_path / "package.json"
+        requirements_path = project_path / "requirements.txt"
+        
+        if package_json_path.exists():
+            # Node.js project
+            command = "npm install"
+        elif requirements_path.exists():
+            # Python project
+            command = "pip install -r requirements.txt"
+        else:
+            raise HTTPException(status_code=400, detail="No package.json or requirements.txt found")
+        
+        # Execute installation command
+        result = await execute_project_command(project_id, command)
+        
+        return {
+            "success": result["success"],
+            "output": result["output"],
+            "command": command
+        }
+        
+    except Exception as e:
+        logger.error(f"Dependency installation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/api/terminal/execute")
 async def execute_terminal_command(command_data: dict):
     """Execute a terminal command in a project"""
@@ -1203,5 +2079,13 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8002,
         reload=True,
-        log_level="info"
+        log_level="info",
+        reload_excludes=[
+            "projects/*/node_modules/*",
+            "projects/*/build/*", 
+            "projects/*/.next/*",
+            "projects/*/.git/*",
+            "*.pyc",
+            "*/__pycache__/*"
+        ]
     )
